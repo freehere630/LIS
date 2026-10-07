@@ -1,0 +1,14 @@
+{
+  "name": "apex-lis-bridge",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "bridge.js",
+  "scripts": {
+    "start": "node bridge.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
+    "dotenv": "^16.4.5",
+    "serialport": "^12.0.0"
+  }
+}
