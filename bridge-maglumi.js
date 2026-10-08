@@ -4,17 +4,16 @@ import { createClient } from '@supabase/supabase-js';
 import dotenv from 'dotenv';
 dotenv.config();
 
-// MLLP Framing Bytes
-const VT = '\x0B'; // 0x0B
-const FS = '\x1C'; // 0x1C
-const CR = '\x0D'; // 0x0D
+// MLLP Framing Bytes (Page B-10 Table 1.3-1)
+const VT = '\x0B'; // 0x0B (<SB> Start Block)
+const FS = '\x1C'; // 0x1C (<EB> End Block)
+const CR = '\x0D'; // 0x0D (<CR> Carriage Return)
 const LF = '\x0A';
 
 // App-Like Modern Color Palette
 const C = {
   reset: '\x1b[0m',
   bold: '\x1b[1m',
-  dim: '\x1b[2m',
   cyan: '\x1b[96m',
   green: '\x1b[92m',
   yellow: '\x1b[93m',
@@ -73,25 +72,21 @@ function log(tag, message, color = C.cyan) {
   console.log(`${C.gray}[${timestamp()}]${C.reset} ${color}${tag.padEnd(11)}${C.reset} ${message}`);
 }
 
-function renderAppHeader() {
-  console.log(`
+console.log(`
 ${C.magenta}${C.bold}╔══════════════════════════════════════════════════════════════════════════════════════╗
-║               APEX LIS BRIDGE — SNIBE MAGLUMI X3 (CLIA / IMMUNOASSAY)                ║
-║                 Bidirectional HL7 v2.5 TSREQ/TSRES Interface Console                 ║
+║               APEX LIS BRIDGE — SNIBE MAGLUMI X3 (OFFICIAL HL7 OML^O33)              ║
+║                 Profile-Expansion & Smart Clinical Alias Engine                      ║
 ╚══════════════════════════════════════════════════════════════════════════════════╝${C.reset}
 
 ${C.cyan}╭─── SYSTEM TELEMETRY ─────────────────────────────────────────────────────────────────╮${C.reset}
 ${C.cyan}│${C.reset}  ${C.white}Local Server IP :${C.reset} ${C.yellow}${C.bold}${getLocalIp()}${C.reset} (Port: ${C.yellow}${process.env.MAGLUMI_PORT || 5003}${C.reset})
-${C.cyan}│${C.reset}  ${C.white}Protocol Stream :${C.reset} ${C.green}HL7 v2.5 MLLP (<VT>...<FS><CR>)${C.reset}
+${C.cyan}│${C.reset}  ${C.white}Profile Support :${C.reset} ${C.green}Active (Auto-unpacks Profiles into Individual Assays)${C.reset}
 ${C.cyan}│${C.reset}  ${C.white}Maglumi Link    :${C.reset} ${stats.clients > 0 ? `${C.green}${C.bold}● CONNECTED & ONLINE${C.reset}` : `${C.yellow}○ LISTENING (Awaiting Analyzer)${C.reset}`}
 ${C.cyan}│${C.reset}  ${C.white}Supabase Cloud  :${C.reset} ${stats.supabase.includes('OK') ? `${C.green}${C.bold}● LIVE CLOUD ACTIVE${C.reset}` : `${C.yellow}● ${stats.supabase}${C.reset}`}
 ${C.cyan}╰──────────────────────────────────────────────────────────────────────────────────────╯${C.reset}
 `);
-}
 
-renderAppHeader();
-
-// Connect to Supabase Cloud
+// Supabase Connection
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 (async () => {
   try {
@@ -113,7 +108,6 @@ function wrapMllp(hl7Text) {
   return `${VT}${hl7Text}${FS}${CR}`;
 }
 
-// Generate Standard HL7 Acknowledgement (ACK)
 function makeHl7Ack(mshSegment, ackCode = 'AA', textMessage = 'Message Accepted') {
   const fields = (mshSegment || '').split('|');
   const sendingApp = fields[4] || 'Lis';
@@ -127,7 +121,6 @@ function makeHl7Ack(mshSegment, ackCode = 'AA', textMessage = 'Message Accepted'
   return `${msh}${CR}${msa}${CR}`;
 }
 
-// Clean barcode helper
 function cleanBarcodeString(raw) {
   if (!raw) return '';
   const firstToken = String(raw).split('^')[0].trim();
@@ -135,8 +128,47 @@ function cleanBarcodeString(raw) {
   return match ? match[1] : firstToken;
 }
 
-// Extract true tube barcode prioritizing OBR over PID
+// SMART CLINICAL ALIAS DICTIONARY (Maps Maglumi assay codes to LIMS parameter names)
+const ASSAY_ALIASES = [
+  { maglumi: ['FT3', 'FT3 II'], lims: ['FT3', 'FT3 II', 'FREE T3', 'FREE TRIIODOTHYRONINE'] },
+  { maglumi: ['FT4', 'FT4 II'], lims: ['FT4', 'FT4 II', 'FREE T4', 'FREE THYROXINE'] },
+  { maglumi: ['TT3', 'TT3 II'], lims: ['TT3', 'TT3 II', 'TOTAL T3', 'T3'] },
+  { maglumi: ['TT4', 'TT4 II'], lims: ['TT4', 'TT4 II', 'TOTAL T4', 'T4'] },
+  { maglumi: ['TSH', 'TSH II'], lims: ['TSH', 'TSH II', 'THYROID STIMULATING HORMONE'] },
+  { maglumi: ['PSA', 'TPSA'],   lims: ['PSA', 'TOTAL PSA'] },
+  { maglumi: ['FPSA'],         lims: ['FPSA', 'FREE PSA'] },
+  { maglumi: ['VB12'],         lims: ['VB12', 'VITAMIN B12', 'B12'] },
+  { maglumi: ['VD', '25-OH VD II'], lims: ['VD', 'VITAMIN D', '25-OH VITAMIN D'] },
+  { maglumi: ['FERR', 'FERRITIN II'], lims: ['FERR', 'FERRITIN'] },
+  { maglumi: ['HCG', 'T-B HCG II'], lims: ['HCG', 'BETA HCG', 'B-HCG', 'TOTAL HCG'] },
+  { maglumi: ['A-CCP'],        lims: ['A-CCP', 'ANTI-CCP', 'ANTI CCP', 'CCP'] },
+  { maglumi: ['PRL', 'PRL II'], lims: ['PRL', 'PROLACTIN'] },
+  { maglumi: ['FSH', 'FSH II'], lims: ['FSH'] },
+  { maglumi: ['LH', 'LH II'],   lims: ['LH'] },
+  { maglumi: ['E2', 'ESTRADIOL'], lims: ['E2', 'ESTRADIOL'] },
+  { maglumi: ['TESTO', 'TEST II'], lims: ['TESTO', 'TESTOSTERONE'] },
+  { maglumi: ['cTnI', 'cTnI II'],  lims: ['CTNI', 'TROPONIN I', 'TROPONIN'] },
+  { maglumi: ['HBsAg Quant'],      lims: ['HBSAG', 'HBSAG QUANT'] }
+];
+
+function resolveAssayToMaglumiCode(text) {
+  const up = String(text || '').trim().toUpperCase();
+  for (const alias of ASSAY_ALIASES) {
+    if (alias.lims.some(l => up === l || up.includes(l))) {
+      return alias.maglumi;
+    }
+  }
+  return [text.trim()];
+}
+
 function extractTubeBarcode(hl7Segments = []) {
+  const spmSeg = hl7Segments.find(s => s.startsWith('SPM'));
+  if (spmSeg) {
+    const parts = spmSeg.split('|');
+    const val = cleanBarcodeString(parts[2]);
+    if (val) return val;
+  }
+
   const obrSeg = hl7Segments.find(s => s.startsWith('OBR'));
   if (obrSeg) {
     const parts = obrSeg.split('|');
@@ -144,24 +176,17 @@ function extractTubeBarcode(hl7Segments = []) {
     if (val && val !== '1' && val !== '0') return val;
   }
 
-  const orcSeg = hl7Segments.find(s => s.startsWith('ORC'));
-  if (orcSeg) {
-    const parts = orcSeg.split('|');
-    const val = cleanBarcodeString(parts[2] || parts[3]);
-    if (val && val !== '1' && val !== '0') return val;
-  }
-
   const pidSeg = hl7Segments.find(s => s.startsWith('PID'));
   if (pidSeg) {
     const parts = pidSeg.split('|');
-    const val = cleanBarcodeString(parts[3] || parts[2] || parts[4]);
+    const val = cleanBarcodeString(parts[3] || parts[2]);
     if (val) return val;
   }
 
   return '';
 }
 
-// 1. BIDIRECTIONAL HOST QUERY: AUTO-DOWNLOAD TEST ASSAYS TO MAGLUMI X3
+// 1. HOST QUERY: EXPANDS PROFILES INTO INDIVIDUAL ASSAYS
 async function handleHl7Query(qSegment, mshSegment, socket, allSegments) {
   stats.queries++;
   const localNow = getLocalHl7Timestamp();
@@ -185,16 +210,15 @@ async function handleHl7Query(qSegment, mshSegment, socket, allSegments) {
   stats.activeSample = sampleBarcode;
 
   console.log(`
-${C.yellow}╭─── INCOMING HOST QUERY ──────────────────────────────────────────────╮${C.reset}
+${C.yellow}╭─── INCOMING HOST QUERY (TSREQ) ──────────────────────────────────────╮${C.reset}
 ${C.yellow}│${C.reset}  Tube Barcode  : ${C.white}${C.bold}${sampleBarcode}${C.reset}
 ${C.yellow}│${C.reset}  Rack/Position : ${C.gray}${rackPos}${C.reset}
 ${C.yellow}╰──────────────────────────────────────────────────────────────────────╯${C.reset}
 `);
 
-  // 1. Check in-memory cache first (0ms latency & 0 API requests)
+  // Check cache first
   let order = getCachedOrder(sampleBarcode);
   if (!order) {
-    // 2. Query Supabase and cache result
     let { data: dbOrder } = await supabase
       .from('orders')
       .select(`*, patient:patients(*), order_tests(*, test:tests(*, test_parameters(*)))`)
@@ -218,67 +242,73 @@ ${C.yellow}╰──────────────────────
 
   if (!order) {
     log('[NO-ORDER]', `${C.red}Barcode ${sampleBarcode} not found in database${C.reset}`, C.red);
-    socket.write(Buffer.from(wrapMllp(makeHl7Ack(mshSegment, 'AE', `Barcode ${sampleBarcode} Not Found`)), 'utf8'));
+    socket.write(wrapMllp(makeHl7Ack(mshSegment, 'AE', `Barcode ${sampleBarcode} Not Found`)));
     return;
   }
 
-  // Fetch analyzer mappings if any
-  const { data: mappings } = await supabase.from('analyzer_mappings').select('*').eq('analyzer_name', 'MAGLUMI_X3');
-  const mappingMap = new Map();
-  (mappings || []).forEach(m => mappingMap.set(m.lims_test_id, m.machine_test_code));
-
+  // PROFILE EXPANSION ENGINE:
+  // If the ordered test is a profile (e.g. Thyroid Profile), unpack each of its child parameters (TSH, FT3, FT4)!
   const assayList = [];
-  (order.order_tests || []).forEach(ot => {
-    const testId = ot.test_id || ot.test?.id;
-    let codeToUse = '';
-    if (mappingMap.has(testId)) codeToUse = mappingMap.get(testId);
-    else if (ot.test?.code) codeToUse = ot.test.code;
-    else if (ot.test?.name) codeToUse = ot.test.name;
 
-    if (codeToUse) {
-      const trimmed = codeToUse.trim();
-      if (!assayList.includes(trimmed)) assayList.push(trimmed);
-      if (trimmed.toUpperCase().includes('FT3') && !assayList.includes('FT3 II')) assayList.push('FT3 II');
-      if (trimmed.toUpperCase().includes('FT4') && !assayList.includes('FT4 II')) assayList.push('FT4 II');
-      if (trimmed.toUpperCase().includes('TT3') && !assayList.includes('TT3 II')) assayList.push('TT3 II');
+  (order.order_tests || []).forEach(ot => {
+    const test = ot.test || {};
+    const params = test.test_parameters || test.parameters || [];
+
+    if (params.length > 1) {
+      // It's a profile panel! Unpack each parameter into an individual Maglumi assay:
+      params.forEach(p => {
+        const codes = resolveAssayToMaglumiCode(p.name);
+        codes.forEach(c => {
+          if (!assayList.includes(c)) assayList.push(c);
+        });
+      });
+    } else {
+      // It's an individual single test:
+      const codes = resolveAssayToMaglumiCode(test.code || test.name || '');
+      codes.forEach(c => {
+        if (!assayList.includes(c)) assayList.push(c);
+      });
     }
   });
 
+  if (assayList.length === 0) {
+    log('[NO-TESTS]', `No Maglumi assays prescribed for ${sampleBarcode}`, C.yellow);
+    socket.write(wrapMllp(makeHl7Ack(mshSegment, 'AA', 'No Tests Prescribed')));
+    return;
+  }
+
   const patient = order.patient || {};
-  const gender = (patient.gender || '').toUpperCase().startsWith('F') ? 'F' : 'M';
+  const gender = (patient.gender || '').toUpperCase().startsWith('F') ? 'Female' : 'Male';
   const patientName = (patient.name || 'Patient').replace(/[|^\\]/g, '');
   const patientId = String(patient.id || sampleBarcode);
 
-  // EXACT SNIBE MAGLUMI X3 HL7 v2.5 TSRES RESPONSE:
-  const respMsh = `MSH|^~\\&|${sendingApp}||${receivingApp}||${localNow}||TSRES|${incomingControlId}|P|2.5|||NE|NE||UTF-8`;
-  const respMsa = `MSA|AA|${incomingControlId}|Success`;
-  const respQak = `QAK|TSREQ|OK|TSREQ`;
-  const exactQpd = allSegments.find(s => s.startsWith('QPD')) || `QPD|TSREQ||${rawBarcodeField}|0`;
-  const respPid = `PID|1||${patientId}||${patientName}|||${gender}`;
-  const respOrc = `ORC|NW|${sampleBarcode}|${rawBarcodeField}|||||||`;
+  // OFFICIAL SNIBE MAGLUMI X3 SPECIFICATION (Page B-19 Section 1.3.5.1):
+  const respMsh = `MSH|^~\\&|${sendingApp}||${receivingApp}||${localNow}||OML^O33|${incomingControlId}|P|2.5|||NE|NE||UTF-8`;
+  const respPid = `PID|1||${patientId}||${patientName}|||${gender}||||||||||||||||||||||||||||||^Years Old`;
+  const respSpm = `SPM|1|${sampleBarcode}^^|||||||||P`;
+  const respOrc = `ORC|NW||||||N`;
 
-  // OBR segments matching exact button names on Maglumi screen
+  // Build OBR line for each assay in the profile:
   const obrSegments = assayList.map((testCode, idx) => 
-    `OBR|${idx + 1}|${sampleBarcode}|${rawBarcodeField}|${testCode}^${testCode}||||||A||||Serum`
+    `OBR|${idx + 1}|||${testCode}^`
   ).join(CR);
 
-  const fullResponse = `${respMsh}${CR}${respMsa}${CR}${respQak}${CR}${exactQpd}${CR}${respPid}${CR}${respOrc}${CR}${obrSegments}${CR}`;
-  socket.write(Buffer.from(wrapMllp(fullResponse), 'utf8'));
+  const fullResponse = `${respMsh}${CR}${respPid}${CR}${respSpm}${CR}${respOrc}${CR}${obrSegments}${CR}`;
+  socket.write(wrapMllp(fullResponse));
 
   console.log(`
-${C.green}╭─── WORKLIST DISPATCHED TO MAGLUMI ───────────────────────────────────╮${C.reset}
+${C.green}╭─── WORKLIST DISPATCHED TO MAGLUMI (OML^O33) ─────────────────────────╮${C.reset}
 ${C.green}│${C.reset}  Patient Name : ${C.white}${patientName} (${patientId})${C.reset}
 ${C.green}│${C.reset}  Auto-Selected: ${C.cyan}${C.bold}${assayList.join(', ')}${C.reset}
-${C.green}│${C.reset}  Status       : ${C.green}✓ Assigned to Rack ${rackPos}${C.reset}
+${C.green}│${C.reset}  Profile Tests: ${C.green}✓ All child assays in profile unpacked & dispatched!${C.reset}
 ${C.green}╰──────────────────────────────────────────────────────────────────────╯${C.reset}
 `);
 }
 
-// 2. RECEIVE TEST RESULTS (ORU^R01)
+// 2. RECEIVE RESULTS: SMART ALIAS MATCHING BACK TO PROFILE PARAMETERS
 async function handleHl7Results(hl7Segments, mshSegment, socket) {
-  socket.write(Buffer.from(wrapMllp(makeHl7Ack(mshSegment, 'AA', 'Results Accepted')), 'utf8'));
+  socket.write(wrapMllp(makeHl7Ack(mshSegment, 'AA', 'Results Accepted')));
 
-  // Extract true tube barcode prioritizing OBR over PID
   const sampleBarcode = extractTubeBarcode(hl7Segments) || (stats.activeSample !== '—' ? stats.activeSample : 'UNKNOWN');
   stats.activeSample = sampleBarcode;
 
@@ -307,9 +337,8 @@ async function handleHl7Results(hl7Segments, mshSegment, socket) {
   for (const res of parsedResults) {
     stats.results++;
 
-    // COLORFUL RESULT CARD
     console.log(`
-${C.magenta}╭─── MAGLUMI X3 TEST RESULT RECEIVED ──────────────────────────────────╮${C.reset}
+${C.magenta}╭─── MAGLUMI X3 TEST RESULT RECEIVED (OUL^R22) ────────────────────────╮${C.reset}
 ${C.magenta}│${C.reset}  ${C.white}Tube Barcode${C.reset} : ${C.yellow}${C.bold}${sampleBarcode}${C.reset}
 ${C.magenta}│${C.reset}  ${C.white}Assay / Test${C.reset} : ${C.cyan}${C.bold}${res.testName} (${res.testCode})${C.reset}
 ${C.magenta}│${C.reset}  ${C.white}Result Value${C.reset} : ${C.green}${C.bold}${res.resultValue}${C.reset}
@@ -318,17 +347,18 @@ ${C.magenta}│${C.reset}  ${C.white}Ref. Range${C.reset}   : ${C.gray}${res.ref
 ${C.magenta}╰──────────────────────────────────────────────────────────────────────╯${C.reset}
 `);
 
+    // Save to Cloud Supabase
     try {
       let { data: order } = await supabase
         .from('orders')
-        .select('id, qc_status, is_locked')
+        .select(`id, qc_status, is_locked, order_tests(*, test:tests(*, test_parameters(*)))`)
         .eq('barcode', sampleBarcode)
         .maybeSingle();
 
       if (!order) {
         const { data: patientOrder } = await supabase
           .from('orders')
-          .select('id, qc_status, is_locked')
+          .select(`id, qc_status, is_locked, order_tests(*, test:tests(*, test_parameters(*)))`)
           .eq('patient_id', sampleBarcode)
           .order('created_at', { ascending: false })
           .limit(1)
@@ -341,24 +371,39 @@ ${C.magenta}╰─────────────────────�
         continue;
       }
 
-      // CLINICAL LOCK GUARD: Never overwrite verified & locked clinical reports!
       if (order.is_locked === true || order.qc_status === 'Verified') {
-        console.log(`\n  ${C.yellow}${C.bold}⚠ [LOCKED] Order ${order.id} (${sampleBarcode}) is already VERIFIED & LOCKED!${C.reset}`);
-        console.log(`  ${C.gray}Machine result ${res.testCode} = ${res.resultValue} discarded to protect signed report.${C.reset}\n`);
-        log('[LOCKED]', `Order is verified/locked. Overwrite blocked (${sampleBarcode})`, C.yellow);
+        console.log(`  ${C.yellow}⚠ Order ${order.id} is VERIFIED & LOCKED! Machine result discarded.${C.reset}`);
         continue;
       }
 
-      // Check analyzer mappings
-      const { data: mapping } = await supabase
-        .from('analyzer_mappings')
-        .select('lims_parameter_id')
-        .eq('analyzer_name', 'MAGLUMI_X3')
-        .eq('machine_test_code', res.testCode)
-        .maybeSingle();
+      // FIND EXACT PARAMETER MATCH (Even inside Multi-Parameter Profiles!)
+      let targetParamId = null;
+      const cleanMachineCode = res.testCode.toUpperCase().replace(/\s+/g, '');
 
-      let targetParamId = mapping?.lims_parameter_id;
+      // Check all parameters inside the ordered tests
+      for (const ot of (order.order_tests || [])) {
+        const params = ot.test?.test_parameters || ot.test?.parameters || [];
+        for (const p of params) {
+          const pName = (p.name || '').toUpperCase().replace(/\s+/g, '');
+          
+          // Match by name or alias (e.g. 'FT3' matches 'Free T3', 'TSH' matches 'TSH')
+          if (
+            pName === cleanMachineCode ||
+            pName.includes(cleanMachineCode) ||
+            cleanMachineCode.includes(pName) ||
+            (cleanMachineCode.includes('FT3') && pName.includes('FREET3')) ||
+            (cleanMachineCode.includes('FT4') && pName.includes('FREET4')) ||
+            (cleanMachineCode.includes('TT3') && pName.includes('TOTALT3')) ||
+            (cleanMachineCode.includes('TT4') && pName.includes('TOTALT4'))
+          ) {
+            targetParamId = p.id;
+            break;
+          }
+        }
+        if (targetParamId) break;
+      }
 
+      // Fallback: direct search in test_parameters table
       if (!targetParamId) {
         const { data: param } = await supabase
           .from('test_parameters')
@@ -370,17 +415,7 @@ ${C.magenta}╰─────────────────────�
       }
 
       if (!targetParamId) {
-        const { data: testItem } = await supabase
-          .from('tests')
-          .select('id')
-          .or(`code.ilike.%${res.testCode}%,name.ilike.%${res.testCode}%`)
-          .limit(1)
-          .maybeSingle();
-        targetParamId = testItem?.id;
-      }
-
-      if (!targetParamId) {
-        log('[UNMAPPED]', `${C.yellow}Assay '${res.testCode}' not mapped in LIMS directory${C.reset}`);
+        log('[UNMAPPED]', `${C.yellow}Assay '${res.testCode}' not mapped in order parameters${C.reset}`);
         continue;
       }
 
@@ -399,10 +434,10 @@ ${C.magenta}╰─────────────────────�
   }
 }
 
-// 3. TCP Server with Keep-Alive & Automatic Reconnection Protection
+// 3. TCP Server with Keep-Alive
 const server = net.createServer((socket) => {
   stats.clients++;
-  socket.setKeepAlive(true, 10000); // Prevents socket freeze between tests!
+  socket.setKeepAlive(true, 10000);
   log('[LINK]', `${C.green}Maglumi X3 connected (${socket.remoteAddress})${C.reset}`);
 
   let rawBuffer = '';
@@ -441,13 +476,13 @@ const server = net.createServer((socket) => {
       const messageType = mshParts[8] || '';
 
       try {
-        if (messageType.includes('TSREQ') || messageType.includes('QRY') || messageType.includes('QBP') || segments.some(s => s.startsWith('QPD') || s.startsWith('QRD'))) {
-          const qSeg = segments.find(s => s.startsWith('QPD') || s.startsWith('QRD')) || '';
+        if (messageType.includes('TSREQ') || messageType.includes('QRY') || segments.some(s => s.startsWith('QPD'))) {
+          const qSeg = segments.find(s => s.startsWith('QPD')) || '';
           await handleHl7Query(qSeg, mshSegment, socket, segments);
-        } else if (messageType.includes('ORU') || segments.some(s => s.startsWith('OBX'))) {
+        } else if (messageType.includes('OUL') || messageType.includes('ORU') || segments.some(s => s.startsWith('OBX'))) {
           await handleHl7Results(segments, mshSegment, socket);
         } else {
-          socket.write(Buffer.from(wrapMllp(makeHl7Ack(mshSegment, 'AA', 'Heartbeat OK')), 'utf8'));
+          socket.write(wrapMllp(makeHl7Ack(mshSegment, 'AA', 'Heartbeat OK')));
         }
       } catch (handlerErr) {
         log('[ERROR]', `${C.red}${handlerErr.message}${C.reset}`);
