@@ -130,35 +130,35 @@ function cleanBarcodeString(raw) {
 
 // SMART CLINICAL ALIAS DICTIONARY (Maps Maglumi assay codes to LIMS parameter names)
 const ASSAY_ALIASES = [
-  { maglumi: ['FT3', 'FT3 II'], lims: ['FT3', 'FT3 II', 'FREE T3', 'FREE TRIIODOTHYRONINE'] },
-  { maglumi: ['FT4', 'FT4 II'], lims: ['FT4', 'FT4 II', 'FREE T4', 'FREE THYROXINE'] },
-  { maglumi: ['TT3', 'TT3 II'], lims: ['TT3', 'TT3 II', 'TOTAL T3', 'T3'] },
-  { maglumi: ['TT4', 'TT4 II'], lims: ['TT4', 'TT4 II', 'TOTAL T4', 'T4'] },
-  { maglumi: ['TSH', 'TSH II'], lims: ['TSH', 'TSH II', 'THYROID STIMULATING HORMONE'] },
-  { maglumi: ['PSA', 'TPSA'],   lims: ['PSA', 'TOTAL PSA'] },
-  { maglumi: ['FPSA'],         lims: ['FPSA', 'FREE PSA'] },
-  { maglumi: ['VB12'],         lims: ['VB12', 'VITAMIN B12', 'B12'] },
-  { maglumi: ['VD', '25-OH VD II'], lims: ['VD', 'VITAMIN D', '25-OH VITAMIN D'] },
-  { maglumi: ['FERR', 'FERRITIN II'], lims: ['FERR', 'FERRITIN'] },
-  { maglumi: ['HCG', 'T-B HCG II'], lims: ['HCG', 'BETA HCG', 'B-HCG', 'TOTAL HCG'] },
-  { maglumi: ['A-CCP'],        lims: ['A-CCP', 'ANTI-CCP', 'ANTI CCP', 'CCP'] },
-  { maglumi: ['PRL', 'PRL II'], lims: ['PRL', 'PROLACTIN'] },
-  { maglumi: ['FSH', 'FSH II'], lims: ['FSH'] },
-  { maglumi: ['LH', 'LH II'],   lims: ['LH'] },
-  { maglumi: ['E2', 'ESTRADIOL'], lims: ['E2', 'ESTRADIOL'] },
-  { maglumi: ['TESTO', 'TEST II'], lims: ['TESTO', 'TESTOSTERONE'] },
-  { maglumi: ['cTnI', 'cTnI II'],  lims: ['CTNI', 'TROPONIN I', 'TROPONIN'] },
-  { maglumi: ['HBsAg Quant'],      lims: ['HBSAG', 'HBSAG QUANT'] }
+  { primary: 'FT3 II',        aliases: ['FT3', 'FT3 II', 'FREE T3', 'FREE TRIIODOTHYRONINE'] },
+  { primary: 'FT4 II',        aliases: ['FT4', 'FT4 II', 'FREE T4', 'FREE THYROXINE'] },
+  { primary: 'TT3 II',        aliases: ['TT3', 'TT3 II', 'TOTAL T3', 'T3'] },
+  { primary: 'TT4 II',        aliases: ['TT4', 'TT4 II', 'TOTAL T4', 'T4'] },
+  { primary: 'TSH II',        aliases: ['TSH', 'TSH II', 'THYROID STIMULATING HORMONE'] },
+  { primary: 'PSA',           aliases: ['PSA', 'TPSA', 'TOTAL PSA'] },
+  { primary: 'FPSA',          aliases: ['FPSA', 'FREE PSA'] },
+  { primary: 'VB12',          aliases: ['VB12', 'VITAMIN B12', 'B12'] },
+  { primary: '25-OH VD II',   aliases: ['VD', 'VITAMIN D', '25-OH VITAMIN D', '25-OH VD II'] },
+  { primary: 'FERRITIN II',   aliases: ['FERR', 'FERRITIN', 'FERRITIN II'] },
+  { primary: 'T-B HCG II',    aliases: ['HCG', 'BETA HCG', 'B-HCG', 'TOTAL HCG', 'T-B HCG II'] },
+  { primary: 'A-CCP',         aliases: ['A-CCP', 'ANTI-CCP', 'ANTI CCP', 'CCP'] },
+  { primary: 'PRL II',        aliases: ['PRL', 'PRL II', 'PROLACTIN'] },
+  { primary: 'FSH II',        aliases: ['FSH', 'FSH II'] },
+  { primary: 'LH II',         aliases: ['LH', 'LH II'] },
+  { primary: 'E2',            aliases: ['E2', 'ESTRADIOL'] },
+  { primary: 'TEST II',       aliases: ['TESTO', 'TEST II', 'TESTOSTERONE'] },
+  { primary: 'cTnI II',       aliases: ['CTNI', 'CTNI II', 'TROPONIN I', 'TROPONIN'] },
+  { primary: 'HBsAg Quant',   aliases: ['HBSAG', 'HBSAG QUANT'] }
 ];
 
 function resolveAssayToMaglumiCode(text) {
   const up = String(text || '').trim().toUpperCase();
-  for (const alias of ASSAY_ALIASES) {
-    if (alias.lims.some(l => up === l || up.includes(l))) {
-      return alias.maglumi;
+  for (const item of ASSAY_ALIASES) {
+    if (item.aliases.some(alias => up === alias || up.includes(alias))) {
+      return item.primary; // Returns ONLY the primary code to send to Maglumi
     }
   }
-  return [text.trim()];
+  return text.trim();
 }
 
 function extractTubeBarcode(hl7Segments = []) {
@@ -248,26 +248,22 @@ ${C.yellow}╰──────────────────────
 
   // PROFILE EXPANSION ENGINE:
   // If the ordered test is a profile (e.g. Thyroid Profile), unpack each of its child parameters (TSH, FT3, FT4)!
-  const assayList = [];
+const assayList = [];
 
   (order.order_tests || []).forEach(ot => {
     const test = ot.test || {};
     const params = test.test_parameters || test.parameters || [];
 
     if (params.length > 1) {
-      // It's a profile panel! Unpack each parameter into an individual Maglumi assay:
+      // Profile panel: resolve each child parameter
       params.forEach(p => {
-        const codes = resolveAssayToMaglumiCode(p.name);
-        codes.forEach(c => {
-          if (!assayList.includes(c)) assayList.push(c);
-        });
+        const code = resolveAssayToMaglumiCode(p.name);
+        if (code && !assayList.includes(code)) assayList.push(code);
       });
     } else {
-      // It's an individual single test:
-      const codes = resolveAssayToMaglumiCode(test.code || test.name || '');
-      codes.forEach(c => {
-        if (!assayList.includes(c)) assayList.push(c);
-      });
+      // Individual test
+      const code = resolveAssayToMaglumiCode(test.code || test.name || '');
+      if (code && !assayList.includes(code)) assayList.push(code);
     }
   });
 
