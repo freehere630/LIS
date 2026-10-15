@@ -1,99 +1,94 @@
 // ============================================================
 // APEX LIS BRIDGE — Arrows KT-44 (Hematology / CBC)
-// Bidirectional ASTM E1394 communication engine
+// v5 — maps 3-part → 5-part, fixes missing differential
 // ============================================================
 
 import net from 'net';
 import os from 'os';
+import fs from 'fs';
 import { createClient } from '@supabase/supabase-js';
 import dotenv from 'dotenv';
 dotenv.config();
 
-// ASTM control characters
-const ENQ = '\x05', ACK = '\x06', NAK = '\x15', EOT = '\x04';
-const STX = '\x02', ETX = '\x03', CR = '\x0D', LF = '\x0A';
+const ACK = 0x06, ENQ = 0x05;
 
-// Console colors
 const C = {
-  reset:  '\x1b[0m',
-  bright: '\x1b[1m',
-  blue:   '\x1b[34m',
-  green:  '\x1b[32m',
-  yellow: '\x1b[33m',
-  red:    '\x1b[31m',
-  cyan:   '\x1b[36m',
-  gray:   '\x1b[90m',
-  white:  '\x1b[37m',
+  reset: '\x1b[0m', bright: '\x1b[1m', blue: '\x1b[34m',
+  green: '\x1b[32m', yellow: '\x1b[33m', red: '\x1b[31m',
+  cyan: '\x1b[36m', gray: '\x1b[90m', white: '\x1b[37m',
 };
 
 // ============================================================
-// CODE → LIMS PARAMETER NAME MAP
-// Matches the exact names in MASTER_CBC_PARAMETERS (api.js)
-// Add entries here if your KT-44 emits codes we don't know yet.
+// CODE → LIMS NAME (includes LOINC + KT-44 proprietary codes)
 // ============================================================
 const CODE_TO_LIMS_NAME = {
-  // ---- Red cell series ----
-  'HGB':    'Hemoglobin (Hb)',
-  'HB':     'Hemoglobin (Hb)',
-  'RBC':    'Total Red Blood Cell Count (RBC)',
-  'HCT':    'Packed Cell Volume (PCV / Hematocrit)',
-  'PCV':    'Packed Cell Volume (PCV / Hematocrit)',
-  'MCV':    'Mean Corpuscular Volume (MCV)',
-  'MCH':    'Mean Corpuscular Hemoglobin (MCH)',
-  'MCHC':   'Mean Corpuscular Hb Concentration (MCHC)',
-  'RDW-CV': 'RDW-CV',
-  'RDWCV':  'RDW-CV',
-  'RDW-SD': 'RDW-SD',
-  'RDWSD':  'RDW-SD',
+  // --- Full CBC panel (LOINC) ---
+  '6690-2':  'Total Leucocyte Count (WBC)',
+  '789-8':   'Total Red Blood Cell Count (RBC)',
+  '718-7':   'Hemoglobin (Hb)',
+  '4544-3':  'Packed Cell Volume (PCV / Hematocrit)',
+  '787-2':   'Mean Corpuscular Volume (MCV)',
+  '785-6':   'Mean Corpuscular Hemoglobin (MCH)',
+  '786-4':   'Mean Corpuscular Hb Concentration (MCHC)',
+  '788-0':   'RDW-CV',
+  '21000-5': 'RDW-SD',
+  '777-3':   'Total Platelet Count',
+  '32623-1': 'Mean Platelet Volume (MPV)',
+  '32207-5': 'Platelet Distribution Width (PDW)',
+  // --- 5-part differential (from analyzer where available) ---
+  '736-9':   'Lymphocytes',
+  '731-0':   'Absolute Lymphocyte Count (ALC)',
+  // --- KT-44 proprietary codes (3-part) ---
+  '10030':   'Neutrophils',                     // Gran%  → Neutrophils %
+  '10028':   'Absolute Neutrophil Count (ANC)', // Gran#  → ANC
+  '10029':   '_MID_PCT_',                       // Mid%   → intermediate, handled in derivation
+  '10027':   '_MID_ABS_',                       // Mid#   → intermediate
+  '10002':   'Plateletcrit (PCT)',
+  // --- Short codes as fallback ---
+  'WBC': 'Total Leucocyte Count (WBC)',
+  'RBC': 'Total Red Blood Cell Count (RBC)',
+  'HGB': 'Hemoglobin (Hb)', 'HB': 'Hemoglobin (Hb)',
+  'HCT': 'Packed Cell Volume (PCV / Hematocrit)',
+  'PCV': 'Packed Cell Volume (PCV / Hematocrit)',
+  'MCV': 'Mean Corpuscular Volume (MCV)',
+  'MCH': 'Mean Corpuscular Hemoglobin (MCH)',
+  'MCHC': 'Mean Corpuscular Hb Concentration (MCHC)',
+  'PLT': 'Total Platelet Count',
+  'MPV': 'Mean Platelet Volume (MPV)',
+  'PDW': 'Platelet Distribution Width (PDW)',
+  'GRAN%': 'Neutrophils',
+  'LYMPH%': 'Lymphocytes',
+};
 
-  // ---- White cell series ----
-  'WBC':    'Total Leucocyte Count (WBC)',
-  'GRAN%':  'Granulocytes (Machine Gran%)',
-  'GRA%':   'Granulocytes (Machine Gran%)',
-  'GRAN':   'Granulocytes (Machine Gran%)',
-  'LYMPH%': 'Lymphocytes (Machine Lymph%)',
-  'LYM%':   'Lymphocytes (Machine Lymph%)',
-  'LYMPH':  'Lymphocytes (Machine Lymph%)',
-  'MID%':   'Mid-cells (Machine Mid%)',
-  'MON%':   'Mid-cells (Machine Mid%)',
-  'MID':    'Mid-cells (Machine Mid%)',
+// These codes must be staged even though they have no direct LIMS parameter
+const INTERMEDIATE_CODES = new Set(['10029', '10027', '_MID_PCT_', '_MID_ABS_']);
 
-  // ---- Platelet series ----
-  'PLT':    'Total Platelet Count',
-  'MPV':    'Mean Platelet Volume (MPV)',
-  'PDW':    'Platelet Distribution Width (PDW)',
-
-  // 5-part differential percentages (match your LIMS template)
-  'Neutrophils':  'Neutrophils',
-  'Lymphocytes':  'Lymphocytes',
-  'Monocytes':    'Monocytes',
-  'Eosinophils':  'Eosinophils',
-  'Basophils':    'Basophils',
-
-  // Absolute counts (bridge computes these from WBC × percentage)
-  'ANC':  'Absolute Neutrophil Count (ANC)',
-  'ALC':  'Absolute Lymphocyte Count (ALC)',
-  'AMC':  'Absolute Monocyte Count (AMC)',
-  'AEC':  'Absolute Eosinophil Count (AEC)',
-  'ABC':  'Absolute Basophil Count (ABC)',
-
-  // Platelet indices the bridge can derive
-  'PCT':  'Plateletcrit (PCT)',
+// Derived keys written by the bridge
+const DERIVED_KEYS = {
+  'Neutrophils': 'Neutrophils',
+  'Lymphocytes': 'Lymphocytes',
+  'Monocytes':   'Monocytes',
+  'Eosinophils': 'Eosinophils',
+  'Basophils':   'Basophils',
+  'ANC': 'Absolute Neutrophil Count (ANC)',
+  'ALC': 'Absolute Lymphocyte Count (ALC)',
+  'AMC': 'Absolute Monocyte Count (AMC)',
+  'AEC': 'Absolute Eosinophil Count (AEC)',
+  'ABC': 'Absolute Basophil Count (ABC)',
+  'PCT': 'Plateletcrit (PCT)',
 };
 
 // ============================================================
-// LIVE TELEMETRY
+// TELEMETRY
 // ============================================================
 const stats = {
-  startedAt:    new Date().toLocaleTimeString(),
-  supabase:     'CONNECTING...',
-  clients:      0,
-  queries:      0,
-  results:      0,
+  startedAt: new Date().toLocaleTimeString(),
+  supabase: 'CONNECTING...',
+  clients: 0, queries: 0, results: 0,
   activeSample: '—',
 };
-
 const recentLogs = [];
+const LOG_LIMIT = 40;
 
 function getLocalIp() {
   const nets = os.networkInterfaces();
@@ -107,393 +102,404 @@ function getLocalIp() {
 
 function addLog(tag, message, color = C.cyan) {
   const time = new Date().toLocaleTimeString();
-  recentLogs.unshift(
-    `${C.gray}[${time}]${C.reset} ${color}${tag.padEnd(10)}${C.reset} ${message}`
-  );
-  if (recentLogs.length > 8) recentLogs.pop();
+  recentLogs.unshift(C.gray + '[' + time + ']' + C.reset + ' ' + color + tag.padEnd(11) + C.reset + ' ' + message);
+  if (recentLogs.length > LOG_LIMIT) recentLogs.pop();
   renderDashboard();
 }
 
 function renderDashboard() {
   console.clear();
-  const linkStatus = stats.clients > 0
-    ? `${C.green}● CONNECTED (Online & Communicating)${C.reset}`
-    : `${C.yellow}○ LISTENING (Awaiting Arrows KT-44 connection)${C.reset}`;
-
+  const linkStatus = stats.clients > 0 ? C.green + '● CONNECTED' + C.reset : C.yellow + '○ LISTENING' + C.reset;
   console.log(`
-${C.cyan}${C.bright}╔══════════════════════════════════════════════════════════════════════════════════╗
-║               APEX LIS BRIDGE — ARROWS KT-44 (HEMATOLOGY / CBC)                  ║
-║                     Bidirectional ASTM & HL7 Communication Engine                ║
-╚══════════════════════════════════════════════════════════════════════════════════╝${C.reset}
+${C.cyan}${C.bright}═══ APEX LIS BRIDGE — ARROWS KT-44 ═══${C.reset}
+  Local IP:      ${C.yellow}${getLocalIp()}${C.reset}   Port: ${C.yellow}${process.env.ARROWS_PORT || 5200}${C.reset}
+  Link:          ${linkStatus}
+  Cloud:         ${stats.supabase.includes('OK') ? C.green + '● LIVE' + C.reset : C.red + '● ' + stats.supabase + C.reset}
 
-  ${C.white}${C.bright}CONNECTION SPECIFICATIONS${C.reset}
-  Local Server IP:  ${C.yellow}${C.bright}${getLocalIp()}${C.reset}
-  Listening Port:   ${C.yellow}TCP ${process.env.ARROWS_PORT || 5200}${C.reset}
-  Link Status:      ${linkStatus}
-  Cloud LIMS:       ${stats.supabase.includes('OK') ? `${C.green}● LIVE CLOUD ACTIVE${C.reset}` : `${C.red}● ${stats.supabase}${C.reset}`}
+  Host Queries:  ${C.cyan}${stats.queries}${C.reset}   CBC Params: ${C.green}${stats.results}${C.reset}   Active: ${C.white}${stats.activeSample}${C.reset}
 
-${C.cyan}────────────────────────────────────────────────────────────────────────────────────${C.reset}
-  ${C.white}${C.bright}SESSION COUNTERS${C.reset}
-  Host Queries:     ${C.cyan}${stats.queries} blood samples scanned${C.reset}
-  CBC Parameters:   ${C.green}${stats.results} results transferred${C.reset}
-  Active Specimen:  ${C.white}${C.bright}${stats.activeSample}${C.reset}
-
-${C.cyan}────────────────────────────────────────────────────────────────────────────────────${C.reset}
-  ${C.white}${C.bright}ARROWS KT-44 LIVE DATA STREAM${C.reset}
-${recentLogs.length > 0 ? recentLogs.join('\n') : `  ${C.gray}Awaiting whole blood vial aspiration on Arrows KT-44...${C.reset}`}
-
-${C.cyan}────────────────────────────────────────────────────────────────────────────────────${C.reset}
-  ${C.gray}Minimize to keep running in background. Press [Ctrl + C] to close this bridge only.${C.reset}
+${C.cyan}── LIVE STREAM ──${C.reset}
+${recentLogs.length > 0 ? recentLogs.join('\n') : '  ' + C.gray + 'Waiting for analyzer...' + C.reset}
 `);
 }
 
-// ============================================================
-// SUPABASE CLIENT
-// ============================================================
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
-
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 (async () => {
   try {
     const { error } = await supabase.from('orders').select('id').limit(1);
     stats.supabase = error ? `ERROR (${error.code})` : 'OK (Connected)';
-  } catch (e) {
-    stats.supabase = 'DISCONNECTED';
-  }
+  } catch (e) { stats.supabase = 'DISCONNECTED'; }
   renderDashboard();
 })();
 
 // ============================================================
-// ASTM FRAME HELPERS
+// UNIT CONVERSION
 // ============================================================
-function calculateAstmChecksum(frame) {
-  let sum = 0;
-  for (let i = 0; i < frame.length; i++) {
-    sum = (sum + frame.charCodeAt(i)) % 256;
+function normalizeValueForLims(limsName, rawValue) {
+  const n = parseFloat(String(rawValue).replace(/,/g, ''));
+  if (isNaN(n)) return String(rawValue).trim();
+  const name = String(limsName || '').toUpperCase();
+
+  if (name.includes('TOTAL LEUCOCYTE') || name.includes('WBC')) {
+    if (n > 0 && n < 100) return String(Math.round(n * 1000));
+    return String(Math.round(n));
   }
-  return sum.toString(16).toUpperCase().padStart(2, '0');
-}
-
-function makeAstmFrame(frameNumber, payload) {
-  const inner = `${frameNumber}${payload}${CR}${ETX}`;
-  return `${STX}${inner}${calculateAstmChecksum(inner)}${CR}${LF}`;
-}
-
-// ============================================================
-// HOST QUERY — Analyzer scanned a barcode, asks for worklist
-// ============================================================
-async function handleHostQuery(sampleBarcode, socket) {
-  stats.queries++;
-  stats.activeSample = sampleBarcode;
-  addLog('[QUERY]', `Arrows KT-44 scanned tube: ${C.bright}${sampleBarcode}${C.reset}`, C.yellow);
-
-  const { data: order, error } = await supabase
-    .from('orders')
-    .select(`*, patient:patients(*), order_tests(*, test:tests(*, test_parameters(*)))`)
-    .eq('barcode', sampleBarcode.trim())
-    .maybeSingle();
-
-  if (error || !order) {
-    addLog('[NO-ORDER]', `Barcode ${sampleBarcode} not in database`, C.red);
-    socket.write(makeAstmFrame(1, `H|\\^&|||ApexLIS|||||||P|1`));
-    socket.write(makeAstmFrame(2, `Q|1|^${sampleBarcode}||ALL||||||||X`));
-    socket.write(makeAstmFrame(3, `L|1|N`));
-    return;
+  if (name.includes('TOTAL PLATELET') || name.includes('PLATELET COUNT')) {
+    if (n > 0 && n < 1000) return String(Math.round(n * 1000));
+    return String(Math.round(n));
   }
-
-  const patient = order.patient || {};
-  const genderCode = (patient.gender || '').toUpperCase().startsWith('F') ? 'F' : 'M';
-  const ageStr = patient.age ? String(patient.age) : '0';
-  const patientName = (patient.name || 'Patient').replace(/[|\^]/g, '');
-
-  socket.write(makeAstmFrame(1, `H|\\^&|||ApexLIS|||||||P|1`));
-  socket.write(makeAstmFrame(2, `P|1||${patient.id || 'PID'}||${patientName}||${ageStr}|${genderCode}`));
-  socket.write(makeAstmFrame(3, `O|1|${sampleBarcode}||^^^CBC|||||||A||||WholeBlood`));
-  socket.write(makeAstmFrame(4, `L|1|N`));
-
-  addLog('[DISPATCH]', `Sent CBC worklist to Arrows KT-44 for ${sampleBarcode}`, C.green);
+  if (name.includes('PACKED CELL') || name.includes('PCV') || name.includes('HEMATOCRIT') || name.includes('HAEMATOCRIT')) {
+    if (n > 0 && n < 1) return (n * 100).toFixed(1);
+    return n.toFixed(1);
+  }
+  return String(rawValue).trim();
 }
 
 // ============================================================
-// CBC PARAMETER BUFFER + 5-PART DIFFERENTIAL DERIVATION
+// SUPABASE HELPERS
 // ============================================================
-const pendingSamples = new Map();
-//   Map< barcode, { orderId, params: {}, timeout } >
-
-function normalizeWbc(raw) {
-  // 3-part analyzers usually send WBC as 10^3/uL (e.g. 6.5).
-  // The LIMS stores /cumm (e.g. 6500). If the machine value looks
-  // like thousands (below 100), scale it up. No real patient has
-  // WBC below 100 /cumm.
-  const n = parseFloat(String(raw).replace(/,/g, ''));
-  if (isNaN(n)) return null;
-  return n < 100 ? (n * 1000).toFixed(0) : n.toFixed(0);
-}
-
-// Cache: order_id -> { paramName -> paramId }
 const paramIdCache = new Map();
+const paramNameByIdCache = new Map();
+const orderIdCache = new Map();
+
+async function getOrderIdByBarcode(barcode) {
+  if (!barcode) return null;
+  if (orderIdCache.has(barcode)) return orderIdCache.get(barcode);
+  const { data } = await supabase.from('orders').select('id').eq('barcode', barcode).maybeSingle();
+  if (data) { orderIdCache.set(barcode, data.id); return data.id; }
+  return null;
+}
 
 async function loadParamMapForOrder(orderId) {
   if (paramIdCache.has(orderId)) return paramIdCache.get(orderId);
-
   const { data: orderTests } = await supabase
-    .from('order_tests')
-    .select('test:tests(test_parameters(*))')
-    .eq('order_id', orderId);
-
-  const map = {};
+    .from('order_tests').select('test:tests(test_parameters(*))').eq('order_id', orderId);
+  const map = {}, byId = {};
   if (orderTests) {
     for (const ot of orderTests) {
       const params = ot.test?.test_parameters || [];
       for (const p of params) {
-        if (p.name) map[p.name.trim()] = p.id;
+        if (p.name) { map[p.name.trim().toUpperCase()] = p.id; byId[p.id] = p.name; }
       }
     }
   }
   paramIdCache.set(orderId, map);
+  paramNameByIdCache.set(orderId, byId);
   return map;
 }
 
-async function resolveLimsParamId(orderId, code) {
-  const trimmed = String(code || '').trim();
-  if (!trimmed) return null;
+async function resolveLimsParamId(orderId, code, name) {
+  const codeUp = String(code || '').toUpperCase().trim();
+  const nameUp = String(name || '').toUpperCase().trim();
 
-  // 1. Look up the LIMS parameter NAME from our static map
-  let limsName = CODE_TO_LIMS_NAME[trimmed.toUpperCase()];
-  if (!limsName) limsName = CODE_TO_LIMS_NAME[trimmed]; // exact case (for derived names)
-  if (!limsName) {
-    addLog('[UNMAPPED]', `Code '${trimmed}' not in CODE_TO_LIMS_NAME`, C.yellow);
-    return null;
-  }
+  // Intermediates have no LIMS target — return sentinel
+  if (INTERMEDIATE_CODES.has(codeUp) || INTERMEDIATE_CODES.has(code)) return '__INTERMEDIATE__';
 
-  // 2. Get exact param ID for this order
   const paramMap = await loadParamMapForOrder(orderId);
-  const paramId = paramMap[limsName];
-  if (!paramId) {
-    addLog(
-      '[UNMAPPED]',
-      `Code '${trimmed}' → '${limsName}' but order has no such parameter`,
-      C.yellow
-    );
-    return null;
-  }
-  return paramId;
+  const direct = CODE_TO_LIMS_NAME[codeUp];
+  if (direct && paramMap[direct.toUpperCase()]) return paramMap[direct.toUpperCase()];
+
+  // Name-based fallback
+  if (nameUp.includes('LYMPH') && paramMap['LYMPHOCYTES']) return paramMap['LYMPHOCYTES'];
+  if (nameUp.includes('GRAN')  && paramMap['NEUTROPHILS'])  return paramMap['NEUTROPHILS'];
+  if (nameUp.includes('WBC')   && paramMap['TOTAL LEUCOCYTE COUNT (WBC)']) return paramMap['TOTAL LEUCOCYTE COUNT (WBC)'];
+  if (nameUp.includes('RBC')   && paramMap['TOTAL RED BLOOD CELL COUNT (RBC)']) return paramMap['TOTAL RED BLOOD CELL COUNT (RBC)'];
+  if (nameUp.includes('HGB')   && paramMap['HEMOGLOBIN (HB)']) return paramMap['HEMOGLOBIN (HB)'];
+  if (nameUp.includes('HCT')   && paramMap['PACKED CELL VOLUME (PCV / HEMATOCRIT)']) return paramMap['PACKED CELL VOLUME (PCV / HEMATOCRIT)'];
+  if (nameUp.includes('PLT')   && paramMap['TOTAL PLATELET COUNT']) return paramMap['TOTAL PLATELET COUNT'];
+  if (nameUp.includes('PCT')   && paramMap['PLATELETCRIT (PCT)'])  return paramMap['PLATELETCRIT (PCT)'];
+  if (nameUp.includes('PDW')   && paramMap['PLATELET DISTRIBUTION WIDTH (PDW)']) return paramMap['PLATELET DISTRIBUTION WIDTH (PDW)'];
+
+  return null;
 }
 
-async function saveParamToSupabase(orderId, code, value) {
-  const paramId = await resolveLimsParamId(orderId, code);
-  if (!paramId) return false;
+async function saveParamToSupabase(orderId, code, name, value) {
+  const paramId = await resolveLimsParamId(orderId, code, name);
+  if (paramId === '__INTERMEDIATE__') return false;   // don't write intermediates
+  if (!paramId) { addLog('[UNMAPPED]', `'${code}' (${name})`, C.yellow); return false; }
+
+  const byId = paramNameByIdCache.get(orderId) || {};
+  const limsName = byId[paramId] || name || code;
+  const normalizedValue = normalizeValueForLims(limsName, value);
 
   const { error } = await supabase.from('results').upsert(
-    {
-      order_id: orderId,
-      parameter_id: paramId,
-      result_value: String(value).trim(),
-      status_flag: 'AUTOMATED',
-      analyzer_source: 'ARROWS_KT44',
-    },
+    { order_id: orderId, parameter_id: paramId, result_value: normalizedValue, status_flag: 'AUTOMATED', analyzer_source: 'ARROWS_KT44' },
     { onConflict: 'order_id,parameter_id' }
   );
-
-  if (error) {
-    addLog('[DB-ERR]', `Save failed for ${code}: ${error.message}`, C.red);
-    return false;
-  }
+  if (error) { addLog('[DB-ERR]', `${code}: ${error.message}`, C.red); return false; }
   return true;
 }
 
-async function flushSample(sampleBarcode) {
-  const entry = pendingSamples.get(sampleBarcode);
-  if (!entry) return;
+// Direct derived writer that bypasses resolveLimsParamId's code lookup
+async function saveDerivedToLims(orderId, limsName, value) {
+  const paramMap = await loadParamMapForOrder(orderId);
+  const paramId = paramMap[limsName.toUpperCase()];
+  if (!paramId) return false;
+  const { error } = await supabase.from('results').upsert(
+    { order_id: orderId, parameter_id: paramId, result_value: String(value), status_flag: 'AUTOMATED', analyzer_source: 'ARROWS_KT44' },
+    { onConflict: 'order_id,parameter_id' }
+  );
+  return !error;
+}
 
-  pendingSamples.delete(sampleBarcode);
+// ============================================================
+// STAGING
+// ============================================================
+const pendingSamples = new Map();
+
+function stageResult(barcode, parsed, orderId) {
+  if (!pendingSamples.has(barcode)) {
+    pendingSamples.set(barcode, { orderId, params: {}, timeout: null });
+  }
+  const entry = pendingSamples.get(barcode);
+  entry.params[parsed.code || parsed.name] = parsed;
+  if (entry.timeout) clearTimeout(entry.timeout);
+  entry.timeout = setTimeout(() => { flushSample(barcode).catch(e => addLog('[FLUSH-ERR]', e.message, C.red)); }, 6000);
+}
+
+async function flushSample(barcode) {
+  const entry = pendingSamples.get(barcode);
+  if (!entry) return;
+  pendingSamples.delete(barcode);
   if (entry.timeout) clearTimeout(entry.timeout);
 
   const { orderId, params } = entry;
-  const rawKeys = Object.keys(params);
-  if (rawKeys.length === 0) return;
+  const keys = Object.keys(params);
+  if (keys.length === 0) return;
 
-  // 1. Persist every raw machine value
+  // ---- 1. Save every value that maps to a real LIMS parameter ----
   let rawSaved = 0;
-  for (const code of rawKeys) {
-    const val = params[code];
-    const valueToSave = code.toUpperCase() === 'WBC' ? normalizeWbc(val) : String(val);
-    if (valueToSave == null) continue;
-    const ok = await saveParamToSupabase(orderId, code, valueToSave);
+  for (const key of keys) {
+    const p = params[key];
+    const ok = await saveParamToSupabase(orderId, p.code, p.name, String(p.value));
     if (ok) rawSaved++;
   }
 
-  // 2. Derive 5-part differential from 3-part machine output
-  const norm = (k) => {
-    const v = params[k];
-    return v != null ? parseFloat(v) : null;
+  // ---- 2. Pull the 3-part values from the buffer ----
+  const getVal = (codeOrName) => {
+    for (const k of keys) {
+      const p = params[k];
+      if (p.code === codeOrName || p.name === codeOrName || k === codeOrName) {
+        const n = parseFloat(String(p.value).replace(/,/g, ''));
+        return isNaN(n) ? 0 : n;
+      }
+    }
+    return 0;
   };
 
-  const lymphPct = norm('Lymph%') ?? norm('LYM%') ?? norm('Lymph') ?? 0;
-  const midPct   = norm('Mid%')   ?? norm('MON%') ?? norm('Mid')   ?? 0;
-  const granPct  = norm('Gran%')  ?? norm('GRA%') ?? norm('Gran')  ?? 0;
-  const wbcRaw   = params['WBC'] ?? params['Wbc'] ?? null;
+  const granPct = getVal('10030');  // Gran%
+  const midPct  = getVal('10029');  // Mid%
+  const granAbs = getVal('10028');  // Gran#
+  const midAbs  = getVal('10027');  // Mid#
 
+  // WBC — check multiple potential codes
+  let wbcRaw = getVal('6690-2') || getVal('WBC') || 0;
+  if (wbcRaw > 0 && wbcRaw < 100) wbcRaw = wbcRaw * 1000;  // 10^9/L → /cumm
+
+  // ---- 3. Derive 5-part from 3-part ----
   const derived = {};
 
-  if (granPct > 0 || lymphPct > 0 || midPct > 0) {
+  if (granPct > 0 || midPct > 0) {
     const neutPct = granPct;
-    const lymPct  = lymphPct;
-    const monPct  = midPct * 0.70;
+    const monoPct = midPct * 0.70;
     const eosPct  = midPct * 0.25;
     const basPct  = midPct * 0.05;
 
-    // ---- 5-part differential percentages (as the analyzer reported) ----
-    derived['Neutrophils'] = neutPct.toFixed(1);
-    derived['Lymphocytes'] = lymPct.toFixed(1);
-    derived['Monocytes']   = monPct.toFixed(1);
+    // Only save % if not already provided (Neutrophils is already mapped from Gran%)
+    // For Monocytes/Eos/Basophils — always derive.
+    derived['Monocytes']   = monoPct.toFixed(1);
     derived['Eosinophils'] = eosPct.toFixed(1);
     derived['Basophils']   = basPct.toFixed(1);
 
-    if (wbcRaw != null) {
-      const wbcCumm = parseFloat(normalizeWbc(wbcRaw));
-      if (!isNaN(wbcCumm) && wbcCumm > 0) {
-        const wbcThousands = wbcCumm / 1000;   // convert /cumm → 10^9/L
-
-        // ---- Absolute counts in 10^9/L (except AEC which is per /cumm) ----
-        derived['ANC'] = ((wbcThousands * neutPct) / 100).toFixed(2);
-        derived['ALC'] = ((wbcThousands * lymPct)  / 100).toFixed(2);
-        derived['AMC'] = ((wbcThousands * monPct)  / 100).toFixed(2);
-        derived['ABC'] = ((wbcThousands * basPct)  / 100).toFixed(2);
-
-        // AEC is stored as an absolute raw count (/cumm) in your template
-        derived['AEC'] = String(Math.round((wbcCumm * eosPct) / 100));
+    if (wbcRaw > 0) {
+      const wbcK = wbcRaw / 1000;
+      // Only compute ANC if analyzer didn't supply Gran#
+      if (granAbs > 0) {
+        derived['ANC'] = granAbs.toFixed(2);
+      } else {
+        derived['ANC'] = ((wbcK * neutPct) / 100).toFixed(2);
+      }
+      // Lymphocytes% might come from analyzer; otherwise compute
+      const lymPct = getVal('736-9') || getVal('Lymph%') || 0;
+      if (lymPct > 0) {
+        const alcVal = getVal('731-0');
+        derived['ALC'] = alcVal > 0 ? alcVal.toFixed(2) : ((wbcK * lymPct) / 100).toFixed(2);
+      }
+      if (midAbs > 0) {
+        // Split Mid# proportionally
+        derived['AMC'] = (midAbs * 0.70).toFixed(2);
+        derived['AEC'] = String(Math.round(wbcRaw * eosPct / 100));
+        derived['ABC'] = (midAbs * 0.05).toFixed(2);
+      } else {
+        derived['AMC'] = ((wbcK * monoPct) / 100).toFixed(2);
+        derived['AEC'] = String(Math.round((wbcRaw * eosPct) / 100));
+        derived['ABC'] = ((wbcK * basPct) / 100).toFixed(2);
       }
     }
   }
 
-  // ---- Plateletcrit = PLT (10^3/uL) × MPV (fL) / 10,000 ----
-  const pltRaw = params['PLT'] ?? params['Plt'];
-  const mpvRaw = params['MPV'] ?? params['Mpv'];
-  if (pltRaw != null && mpvRaw != null) {
-    const pltNum = parseFloat(pltRaw);
-    const mpvNum = parseFloat(mpvRaw);
-    if (!isNaN(pltNum) && !isNaN(mpvNum) && pltNum > 0 && mpvNum > 0) {
-      derived['PCT'] = (pltNum * mpvNum / 10000).toFixed(2);
-    }
+  // ---- 4. PCT (Plateletcrit) — derive if analyzer didn't supply ----
+  const plt = getVal('777-3') || getVal('PLT') || 0;
+  const mpv = getVal('32623-1') || getVal('MPV') || 0;
+  if (!getVal('10002') && plt > 0 && mpv > 0) {
+    // PCT = PLT (10^3/uL) × MPV (fL) / 10000 → %
+    const pct = (plt * mpv / 10000).toFixed(2);
+    derived['PCT'] = pct;
   }
 
-  // 3. Persist derived values
+  // ---- 5. Save derived values by their LIMS parameter names ----
   let derivedSaved = 0;
-  for (const [code, val] of Object.entries(derived)) {
-    const ok = await saveParamToSupabase(orderId, code, val);
-    if (ok) derivedSaved++;
+  for (const [k, v] of Object.entries(derived)) {
+    const limsName = DERIVED_KEYS[k] || k;
+    const ok = await saveDerivedToLims(orderId, limsName, v);
+    if (ok) { derivedSaved++; addLog('[DERIVED]', `${limsName} = ${v}`, C.cyan); }
   }
 
-  addLog(
-    '[FLUSH]',
-    `Sample ${sampleBarcode}: ${rawSaved}/${rawKeys.length} raw + ${derivedSaved} derived saved`,
-    C.green
-  );
-
-  // Free the param cache for this order to avoid unbounded growth
+  addLog('[FLUSH]', `${barcode}: ${rawSaved} raw + ${derivedSaved} derived`, C.green);
   paramIdCache.delete(orderId);
+  paramNameByIdCache.delete(orderId);
 }
 
-function stageResult(sampleBarcode, testCode, resultValue, orderId) {
-  if (!pendingSamples.has(sampleBarcode)) {
-    pendingSamples.set(sampleBarcode, { orderId, params: {}, timeout: null });
+// ============================================================
+// OBX PARSER
+// ============================================================
+function parseObxLine(line) {
+  const f = line.split('|');
+  if (f[0] !== 'OBX') return null;
+
+  let typeIdx = -1;
+  for (let i = 1; i < Math.min(f.length, 6); i++) {
+    if (/^[A-Z]{2,3}$/.test((f[i] || '').trim())) { typeIdx = i; break; }
   }
-  const entry = pendingSamples.get(sampleBarcode);
-  entry.params[testCode.trim()] = String(resultValue).trim();
+  if (typeIdx === -1) return null;
 
-  if (entry.timeout) clearTimeout(entry.timeout);
-  entry.timeout = setTimeout(() => {
-    flushSample(sampleBarcode).catch((e) =>
-      addLog('[FLUSH-ERR]', e.message, C.red)
-    );
-  }, 8000);
+  const idField = f[typeIdx + 1] || '';
+  const parts = idField.split('^');
+  const code = (parts[0] || '').trim();
+  const name = (parts[1] || code).trim();
+
+  // Skip empty fields between id and value
+  let valueIdx = typeIdx + 2;
+  while (valueIdx < f.length && (f[valueIdx] || '').trim() === '') valueIdx++;
+
+  const value = (f[valueIdx] || '').trim();
+  const unit  = (f[valueIdx + 1] || '').trim();
+  const ref   = (f[valueIdx + 2] || '').trim();
+
+  return { type: f[typeIdx] || '', code, name, value, unit, ref };
 }
 
-async function handleIncomingResult(sampleBarcode, testCode, resultValue) {
-  stats.results++;
-  stats.activeSample = `${sampleBarcode} (${testCode}: ${resultValue})`;
+// ============================================================
+// SEGMENT PROCESSING
+// ============================================================
+const SEGMENT_PREFIXES = ['MSH|','PID|','PV1|','OBR|','OBX|','ORC|','NTE|','SPM|','MSA|','QRD|','QRF|','QPD|','RCP|','NK1|','AL1|','DG1|','PR1|','GT1|','IN1|','IN2|','IN3|'];
 
-  // DIAGNOSTIC: log every raw code the analyzer sends so we can extend
-  // CODE_TO_LIMS_NAME if any code shows up as [UNMAPPED] later.
-  addLog('[RAW]', `'${testCode}' = ${resultValue}`, C.gray);
+function insertSegmentNewlines(text) {
+  let out = text;
+  for (const prefix of SEGMENT_PREFIXES) {
+    const re = new RegExp('(?!^)' + prefix.replace('|', '\\|'), 'g');
+    out = out.replace(re, '\n' + prefix);
+  }
+  return out;
+}
 
-  const { data: order } = await supabase
-    .from('orders')
-    .select('id')
-    .eq('barcode', sampleBarcode.trim())
-    .maybeSingle();
+let currentBarcode = null;
 
-  if (!order) {
-    addLog('[ERR]', `Unknown tube barcode: ${sampleBarcode}`, C.red);
+async function processSegment(segment) {
+  const firstPipe = segment.indexOf('|');
+  if (firstPipe < 0 || firstPipe > 6) return;
+  const segType = segment.substring(0, firstPipe).toUpperCase();
+
+  if (['MSH','PID','OBR','SPM'].includes(segType)) {
+    const m = segment.match(/\b(20\d{8,10})\b/);
+    if (m) {
+      const newBc = m[1];
+      if (newBc !== currentBarcode) {
+        if (currentBarcode && pendingSamples.has(currentBarcode)) await flushSample(currentBarcode);
+        currentBarcode = newBc;
+        stats.activeSample = newBc;
+        stats.queries++;
+        addLog('[BARCODE]', newBc, C.cyan);
+      }
+    }
     return;
   }
 
-  stageResult(sampleBarcode.trim(), testCode, resultValue, order.id);
+  if (segType !== 'OBX') return;
+  if (/\|ED\|/.test(segment)) return;
+  if (/HISTOGRAM|BINARY|BASE64|OCTER/i.test(segment)) return;
+
+  const parsed = parseObxLine(segment);
+  if (!parsed) return;
+  if (!parsed.code || !parsed.value) return;
+
+  const barcode = currentBarcode || (stats.activeSample !== '—' ? stats.activeSample : null);
+  if (!barcode) return;
+  const orderId = await getOrderIdByBarcode(barcode);
+  if (!orderId) return;
+
+  const paramId = await resolveLimsParamId(orderId, parsed.code, parsed.name);
+
+  // Intermediates — stage for derivation even though they have no LIMS param
+  if (paramId === '__INTERMEDIATE__' || INTERMEDIATE_CODES.has(parsed.code)) {
+    addLog('[STAGE]', `${parsed.code} (${parsed.name}) = ${parsed.value}`, C.cyan);
+    stageResult(barcode, parsed, orderId);
+    return;
+  }
+
+  if (!paramId) {
+    addLog('[SKIP]', `${parsed.code} (${parsed.name})`, C.gray);
+    return;
+  }
+
+  stats.results++;
+  addLog('[RAW]', `${parsed.code} (${parsed.name}) = ${parsed.value} ${parsed.unit || ''}`, C.green);
+  stageResult(barcode, parsed, orderId);
 }
 
 // ============================================================
 // TCP SERVER
 // ============================================================
+let rawBuffer = '';
+
 const server = net.createServer((socket) => {
   stats.clients++;
-  addLog('[LINK]', `Arrows KT-44 connected (${socket.remoteAddress})`, C.green);
+  addLog('[LINK]', `${socket.remoteAddress}`, C.green);
+  rawBuffer = '';
+  currentBarcode = null;
 
-  let buffer = '';
-  let currentBarcode = '';
+  try { socket.write(Buffer.from([ENQ])); } catch (e) {}
 
   socket.on('data', async (chunk) => {
-    const dataStr = chunk.toString('ascii');
+    try { socket.write(Buffer.from([ACK])); } catch (e) {}
 
-    // Handle ENQ handshake carefully: some analyzers send ENQ + first
-    // frame in the same TCP packet. Don't return early — just ACK and
-    // fall through to process the rest.
-    if (dataStr.includes(ENQ)) {
-      socket.write(ACK);
+    const preview = chunk.length > 32 ? chunk.toString('hex').slice(0, 64) + '…' : chunk.toString('hex');
+    console.log(C.gray + '[HEX-IN] len=' + chunk.length + ' ' + preview + C.reset);
+
+    let text = chunk.toString('latin1');
+    text = text.replace(/[^\x09\x0a\x0d\x20-\x7e]/g, '');
+    text = insertSegmentNewlines(text);
+
+    rawBuffer += text;
+
+    const hasAnyPrefix = SEGMENT_PREFIXES.some(p => rawBuffer.includes(p));
+    if (!hasAnyPrefix) {
+      if (rawBuffer.length > 400) rawBuffer = rawBuffer.slice(-200);
+      return;
     }
 
-    // Strip control chars except CR/LF before buffer processing
-    const cleaned = dataStr.replace(/[\x02\x03\x04\x05\x06]/g, '');
-    buffer += cleaned;
+    const lines = rawBuffer.split(/\r?\n/);
+    rawBuffer = lines.pop() || '';
 
-    if (buffer.includes(CR) || buffer.includes(LF)) {
-      socket.write(ACK);
-      const lines = buffer.split(/[\r\n]+/);
-      buffer = '';
+    if (rawBuffer.length > 4096 && !SEGMENT_PREFIXES.some(p => rawBuffer.includes(p))) {
+      rawBuffer = '';
+    }
 
-      for (const rawLine of lines) {
-        // Strip leading frame number digit(s)
-        const clean = rawLine.replace(/^\d+/, '');
-        const parts = clean.split('|');
-        const type = parts[0]?.trim();
-
-        if (type === 'O') {
-          const incomingBarcode = parts[2]?.trim() || '';
-          if (currentBarcode && currentBarcode !== incomingBarcode) {
-            await flushSample(currentBarcode);
-          }
-          currentBarcode = incomingBarcode;
-        } else if (type === 'H') {
-          for (const bc of Array.from(pendingSamples.keys())) {
-            await flushSample(bc);
-          }
-          currentBarcode = '';
-        } else if (type === 'Q') {
-          const qBarcode = parts[2]?.replace(/^\^/, '').split('^')[0]?.trim();
-          if (qBarcode) await handleHostQuery(qBarcode, socket);
-        } else if (type === 'R') {
-          const tCode = (parts[2] || '').replace(/^\^+/, '').split('^')[0]?.trim();
-          const val = parts[3]?.trim();
-          if (currentBarcode && tCode && val) {
-            await handleIncomingResult(currentBarcode, tCode, val);
-          }
-        } else if (type === 'L') {
-          if (currentBarcode) await flushSample(currentBarcode);
-          currentBarcode = '';
-        }
-      }
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try { await processSegment(trimmed); }
+      catch (e) { addLog('[ERR]', e.message, C.red); }
     }
   });
 
@@ -502,12 +508,10 @@ const server = net.createServer((socket) => {
     for (const bc of Array.from(pendingSamples.keys())) {
       await flushSample(bc).catch(() => {});
     }
-    addLog('[UNLINK]', `Arrows KT-44 disconnected`, C.yellow);
+    addLog('[UNLINK]', 'disconnected', C.yellow);
   });
 
-  socket.on('error', (err) => {
-    addLog('[ERROR]', `Arrows: ${err.message}`, C.red);
-  });
+  socket.on('error', (err) => addLog('[ERR]', err.message, C.red));
 });
 
 const port = parseInt(process.env.ARROWS_PORT || '5200', 10);
